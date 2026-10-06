@@ -1,0 +1,178 @@
+name: Windows RDP Session
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 600
+
+    steps:
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          # Enable RDP
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+          
+          # Allow RDP through firewall
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+          
+          # Set RDP service to auto-start
+          Set-Service `
+            -Name TermService `
+            -StartupType Automatic
+          
+          Restart-Service `
+            -Name TermService `
+            -Force
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          $username = "RDPUser"
+          
+          # Generate secure password (24 characters alphanumeric)
+          $chars = (48..57 + 65..90 + 97..122)
+          $password = -join ($chars | Get-Random -Count 24 | ForEach-Object { [char]$_ })
+          
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+          
+          # Remove existing user if present
+          $existing = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+          if ($existing) {
+            Remove-LocalUser -Name $username
+          }
+          
+          # Create new user
+          New-LocalUser `
+            -Name $username `
+            -Password $securePassword `
+            -AccountNeverExpires `
+            -PasswordNeverExpires:$true
+          
+          # Add to RDP group
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username
+          
+          # Store credentials for later steps
+          "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Service
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          # Check if RDP service is running
+          $service = Get-Service TermService
+          if ($service.Status -ne "Running") {
+            throw "Remote Desktop service is not running."
+          }
+          
+          # Check if port 3389 is listening
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+          if (-not $listener) {
+            throw "Nothing is listening on TCP 3389."
+          }
+          
+          Write-Host "✅ RDP service: $($service.Status)"
+          Write-Host "✅ RDP listener detected on port 3389"
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+          
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait `
+            -NoNewWindow
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          
+          # Connect to Tailscale
+          & $tailscale up `
+            --authkey="$env:TS_AUTHKEY" `
+            --hostname="rdp-$env:GITHUB_RUN_ID"
+          
+          Start-Sleep -Seconds 5
+          
+          # Get Tailscale IP
+          $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+          if (-not $ip) {
+            throw "Could not obtain Tailscale IPv4 address."
+          }
+          
+          "TS_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected at: $ip"
+
+      - name: Display Connection Info
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "        ✅ RDP SESSION READY"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "📌 Connection Details:"
+          Write-Host "   Address  : $env:TS_IP"
+          Write-Host "   Port     : 3389"
+          Write-Host "   Username : .\$env:RDP_USERNAME"
+          Write-Host "   Password : $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "📝 How to connect:"
+          Write-Host "   1. Open Remote Desktop Connection (mstsc)"
+          Write-Host "   2. Enter: $env:TS_IP"
+          Write-Host "   3. Use credentials above"
+          Write-Host ""
+          Write-Host "⏱️  Session Duration: 10 hours"
+          Write-Host "=========================================="
+          Write-Host ""
+
+      - name: Keep Session Alive
+        shell: powershell
+        run: |
+          $end = (Get-Date).AddHours(10)
+          Write-Host "🔄 Keeping RDP session alive for 10 hours..."
+          Write-Host "⏰ Session will end at: $($end.ToString('yyyy-MM-dd HH:mm:ss'))"
+          Write-Host ""
+          
+          while ((Get-Date) -lt $end) {
+            $remaining = $end - (Get-Date)
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP active. Remaining: $($remaining.ToString('hh\:mm\:ss'))"
+            Start-Sleep -Seconds 300
+          }
+          
+          Write-Host ""
+          Write-Host "✅ 10-hour RDP session completed."
