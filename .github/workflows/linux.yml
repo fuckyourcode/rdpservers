@@ -1,0 +1,42 @@
+name: Ubuntu-SSH-Terminal
+on: workflow_dispatch
+jobs:
+  ubuntu-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Setup SSH
+        run: |
+          sudo apt update
+          sudo apt install -y openssh-server php libapache2-mod-php php-cli
+          
+          # Set root password
+          echo "root:root" | sudo chpasswd
+          
+          # Configure SSH to allow root login with password
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          
+          # Start SSH
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+          
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=ubuntu-ssh-${{ github.run_id }}
+          TS_IP=$(sudo tailscale ip -4)
+          echo "TS_IP=$TS_IP" >> $GITHUB_ENV
+          
+      - name: Show Connection Info
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "✅ SSH Server Ready"
+          echo "=========================================="
+          echo "ssh root@$TS_IP"
+          echo "Password: root"
+          echo "=========================================="
+          
+      - name: Keep Alive
+        run: sleep 600h
