@@ -1,4 +1,3 @@
-
 name: Android 16 Remote Emulator - Tailscale ADB
 
 on:
@@ -34,6 +33,28 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # ------------------------------------------------------------------
+      # CRITICAL: Enable KVM so the emulator uses hardware acceleration.
+      # Without this, the emulator falls back to pure software emulation
+      # and almost never finishes booting within the timeout.
+      # ------------------------------------------------------------------
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -e
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "KVM is available and writable."
+            ls -l /dev/kvm
+          else
+            echo "ERROR: /dev/kvm is not usable. Emulator will be extremely slow."
+            exit 1
+          fi
+
       - name: Find Android SDK tools
         shell: bash
         run: |
@@ -62,7 +83,7 @@ jobs:
 
           export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 
-          yes | "$SDKMANAGER" --licenses || true
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
 
           "$SDKMANAGER" \
             "platform-tools" \
@@ -70,7 +91,6 @@ jobs:
             "emulator" \
             "system-images;android-36;google_apis;x86_64"
 
-          # Verify ADB installation
           if [ ! -f "$ANDROID_HOME/platform-tools/adb" ]; then
             echo "ERROR: adb was not installed"
             exit 1
@@ -81,26 +101,29 @@ jobs:
       - name: Verify emulator acceleration
         shell: bash
         run: |
+          set -e
           export PATH="$ANDROID_HOME/emulator:$PATH"
 
           echo "CPU architecture:"
           uname -m
 
           echo "Checking KVM:"
-          if [ -e /dev/kvm ]; then
+          if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then
             ls -l /dev/kvm
+            echo "KVM writable: yes"
           else
-            echo "KVM device unavailable; emulator will use software acceleration."
+            echo "KVM writable: no"
+            exit 1
           fi
 
-          emulator -accel-check || true
+          emulator -accel-check
 
       - name: Create Android 16 AVD
         shell: bash
         run: |
           set -e
 
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 
           echo "no" | avdmanager create avd \
             --force \
@@ -121,22 +144,13 @@ jobs:
 
           export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 
-          # Select acceleration based on KVM availability
-          if [ -e /dev/kvm ]; then
-            echo "KVM detected. Using hardware acceleration."
-            ACCEL="on"
-          else
-            echo "KVM not detected. Using software acceleration."
-            ACCEL="off"
-          fi
-
-          # Start emulator
-          "$EMULATOR" \
+          # Start emulator with hardware acceleration and no GPU rendering
+          nohup "$EMULATOR" \
             -avd "$AVD_NAME" \
             -port 5554 \
             -no-window \
             -gpu swiftshader_indirect \
-            -accel "$ACCEL" \
+            -accel on \
             -no-snapshot \
             -wipe-data \
             -no-boot-anim \
@@ -153,11 +167,9 @@ jobs:
           "$ADB" -s emulator-5554 wait-for-device
 
           BOOTED=0
-
-          # Wait up to 15 minutes for Android boot completion
           for i in $(seq 1 180); do
             STATUS=$("$ADB" -s emulator-5554 shell \
-              getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+              getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
 
             if [ "$STATUS" = "1" ]; then
               BOOTED=1
@@ -171,7 +183,7 @@ jobs:
           if [ "$BOOTED" != "1" ]; then
             echo "ERROR: Android failed to boot."
 
-            echo "----- Emulator log -----"
+            echo "----- Emulator log (tail) -----"
             tail -200 emulator.log || true
 
             echo "----- ADB devices -----"
@@ -182,6 +194,11 @@ jobs:
 
             exit 1
           fi
+
+          # Give ADB a moment to settle after boot_completed
+          sleep 10
+          "$ADB" -s emulator-5554 wait-for-device
+          "$ADB" -s emulator-5554 shell echo "adb responsive"
 
           "$ADB" -s emulator-5554 shell wm size 1080x1920
           "$ADB" -s emulator-5554 shell wm density 420
@@ -218,14 +235,14 @@ jobs:
 
           ADB="$ANDROID_HOME/platform-tools/adb"
 
-          # Restart ADB listening on all network interfaces
+          # Restart ADB listening on all interfaces
           "$ADB" kill-server || true
           "$ADB" -a start-server
 
           sleep 5
 
           echo "ADB listening status:"
-          ss -lntp | grep 5037
+          ss -lntp | grep 5037 || true
 
           echo "Connected devices:"
           "$ADB" devices -l
@@ -266,7 +283,7 @@ jobs:
             echo "------------------------------"
             date
             "$ADB" devices -l
-            tailscale status
+            tailscale status || true
             sleep 60
           done
 
