@@ -1,0 +1,354 @@
+
+name: Android 16 Cloud Emulator
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android 16 + ADB + VNC + Tailscale
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      ANDROID_API: "36"
+      AVD_NAME: "Android16"
+      DISPLAY: ":99"
+
+    steps:
+
+      # -----------------------------------
+      # 1. Checkout repository
+      # -----------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------------
+      # 2. Setup Java
+      # -----------------------------------
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # -----------------------------------
+      # 3. Setup Android SDK
+      # -----------------------------------
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android 16 SDK
+        run: |
+          yes | sdkmanager --licenses || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "emulator" \
+            "system-images;android-36;google_apis;x86_64"
+
+      # -----------------------------------
+      # 4. Install Linux dependencies
+      # -----------------------------------
+      - name: Install VNC dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            xvfb \
+            x11vnc \
+            openbox \
+            novnc \
+            websockify \
+            curl \
+            wget \
+            libgl1 \
+            libegl1 \
+            libx11-6 \
+            libxcb1 \
+            libxcomposite1 \
+            libxcursor1 \
+            libxdamage1 \
+            libxi6 \
+            libxtst6 \
+            libxrandr2 \
+            libnss3 \
+            libpulse0 \
+            libasound2t64 \
+            libdbus-1-3 \
+            libfontconfig1 \
+            libfreetype6 \
+            libxkbcommon0 \
+            libxkbcommon-x11-0
+
+      # -----------------------------------
+      # 5. Create Android Virtual Device
+      # -----------------------------------
+      - name: Create Android 16 Emulator
+        run: |
+          echo "no" | avdmanager create avd \
+            --force \
+            --name "$AVD_NAME" \
+            --package "system-images;android-36;google_apis;x86_64" \
+            --device "pixel_2"
+
+          emulator -list-avds
+
+      # -----------------------------------
+      # 6. Start Linux virtual display
+      # -----------------------------------
+      - name: Start Virtual Desktop
+        run: |
+          set -e
+
+          Xvfb :99 \
+            -screen 0 1280x800x24 \
+            -ac +extension GLX +render \
+            -noreset > xvfb.log 2>&1 &
+
+          sleep 3
+
+          openbox > openbox.log 2>&1 &
+
+          sleep 3
+
+      # -----------------------------------
+      # 7. Start VNC server
+      # -----------------------------------
+      - name: Start VNC and noVNC
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$VNC_PASSWORD" ] ||
+             [ "${#VNC_PASSWORD}" -lt 6 ] ||
+             [ "${#VNC_PASSWORD}" -gt 8 ]; then
+            echo "VNC_PASSWORD must be 6-8 characters"
+            exit 1
+          fi
+
+          x11vnc -storepasswd \
+            "$VNC_PASSWORD" /tmp/vnc.pass
+
+          chmod 600 /tmp/vnc.pass
+
+          x11vnc \
+            -display :99 \
+            -rfbport 5900 \
+            -rfbauth /tmp/vnc.pass \
+            -localhost \
+            -forever \
+            -shared \
+            -noxdamage \
+            > vnc.log 2>&1 &
+
+          sleep 3
+
+          websockify \
+            --web=/usr/share/novnc \
+            0.0.0.0:6080 \
+            127.0.0.1:5900 \
+            > novnc.log 2>&1 &
+
+          sleep 3
+
+          echo "VNC services started"
+
+      # -----------------------------------
+      # 8. Start Android emulator
+      # -----------------------------------
+      - name: Start Android 16 Emulator
+        run: |
+          set -euo pipefail
+
+          if [ -e /dev/kvm ]; then
+            EMU_ACCEL="-accel on"
+            echo "KVM detected"
+          else
+            EMU_ACCEL="-accel off"
+            echo "KVM unavailable, using software acceleration"
+          fi
+
+          emulator \
+            -avd "$AVD_NAME" \
+            -port 5554 \
+            -gpu swiftshader_indirect \
+            -no-snapshot \
+            -no-boot-anim \
+            -no-audio \
+            -camera-back none \
+            -camera-front none \
+            $EMU_ACCEL \
+            > emulator.log 2>&1 &
+
+          adb start-server
+
+          adb -s emulator-5554 wait-for-device
+
+          BOOTED=0
+
+          for i in $(seq 1 120); do
+            STATUS=$(adb -s emulator-5554 shell \
+              getprop sys.boot_completed 2>/dev/null |
+              tr -d '\r')
+
+            if [ "$STATUS" = "1" ]; then
+              BOOTED=1
+              break
+            fi
+
+            echo "Waiting for Android boot: $i"
+
+            sleep 5
+          done
+
+          if [ "$BOOTED" != "1" ]; then
+            echo "Android boot failed"
+            tail -100 emulator.log
+            exit 1
+          fi
+
+          adb -s emulator-5554 shell wm size 1080x1920
+          adb -s emulator-5554 shell wm density 420
+          adb -s emulator-5554 shell input keyevent 82
+
+          echo "Android 16 booted successfully"
+
+      # -----------------------------------
+      # 9. Connect to Tailscale
+      # -----------------------------------
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: github-android-emulator
+          tags: tag:github-runner
+
+      # -----------------------------------
+      # 10. Enable remote ADB
+      # -----------------------------------
+      - name: Enable Remote ADB
+        run: |
+          adb kill-server
+          adb -a start-server
+
+          sleep 3
+
+          echo "ADB devices:"
+          adb devices -l
+
+          echo "ADB listening port:"
+          ss -lntp | grep 5037 || true
+
+      # -----------------------------------
+      # 11. Install optional APK
+      # -----------------------------------
+      - name: Install APK
+        run: |
+          APK_PATH="app/app-release.apk"
+
+          if [ -f "$APK_PATH" ]; then
+            adb -s emulator-5554 install -r "$APK_PATH"
+            echo "APK installed successfully"
+          else
+            echo "No APK found. Skipping."
+          fi
+
+      # -----------------------------------
+      # 12. Display connection details
+      # -----------------------------------
+      - name: Android Remote Access Information
+        run: |
+          TS_IP=$(tailscale ip -4)
+
+          echo "===================================="
+          echo "ANDROID 16 IS ONLINE"
+          echo "===================================="
+
+          echo ""
+          echo "Tailscale IP: $TS_IP"
+
+          echo ""
+          echo "VNC BROWSER:"
+          echo "http://$TS_IP:6080/vnc.html?autoconnect=true&resize=scale"
+
+          echo ""
+          echo "ADB:"
+          echo "$TS_IP:5037"
+
+          echo ""
+          echo "WINDOWS POWERSHELL:"
+          echo "adb connect $TS_IP:5037"
+
+          echo ""
+          echo "===================================="
+
+          {
+            echo "## Android 16 Cloud Emulator"
+            echo ""
+            echo "| Service | Address |"
+            echo "|---|---|"
+            echo "| Tailscale | $TS_IP |"
+            echo "| VNC | http://$TS_IP:6080/vnc.html |"
+            echo "| ADB | $TS_IP:5037 |"
+            echo ""
+            echo "Session stays active until cancelled or runner timeout."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------
+      # 13. Keep everything running forever
+      # -----------------------------------
+      - name: Keep Emulator Running
+        run: |
+          echo "===================================="
+          echo "ANDROID EMULATOR RUNNING"
+          echo "===================================="
+
+          while true; do
+
+            echo ""
+            echo "Time: $(date)"
+            echo "Android status:"
+
+            adb devices -l
+
+            echo ""
+            echo "Tailscale status:"
+
+            tailscale status
+
+            echo ""
+            echo "VNC status:"
+
+            curl -s -o /dev/null \
+              -w "HTTP %{http_code}\n" \
+              http://127.0.0.1:6080/vnc.html || true
+
+            echo ""
+            echo "Next check in 60 seconds..."
+
+            sleep 60
+
+          done
+
+      # -----------------------------------
+      # 14. Upload logs when stopped
+      # -----------------------------------
+      - name: Upload Emulator Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android16-emulator-logs
+          path: |
+            emulator.log
+            vnc.log
+            novnc.log
+            openbox.log
+            xvfb.log
+          if-no-files-found: ignore
+          retention-days: 1
