@@ -1,11 +1,21 @@
 
-name: Android 16 Cloud Emulator
+name: Android 16 Remote Emulator - Tailscale ADB
 
 on:
   workflow_dispatch:
+    inputs:
+      apk_path:
+        description: "APK path (leave empty to skip)"
+        required: false
+        type: string
+        default: "app/app-release.apk"
+
+permissions:
+  contents: read
 
 jobs:
-  android-emulator:
+  android:
+    name: Android 16 Emulator
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -15,170 +25,143 @@ jobs:
       AVD_NAME: Android16
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      # Avoid the obsolete "tools" SDK package.
-      - name: Locate Android SDK Tools
+      - name: Find Android SDK tools
         shell: bash
         run: |
           set -e
 
           SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager | sort -V | tail -1)
+            -type f -name sdkmanager | sort -V | tail -n 1)
 
           if [ -z "$SDKMANAGER" ]; then
-            echo "sdkmanager not found"
+            echo "ERROR: sdkmanager not found"
             exit 1
           fi
 
-          SDK_DIR=$(dirname "$SDKMANAGER")
-
-          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-          echo "AVDMANAGER=$SDK_DIR/avdmanager" >> "$GITHUB_ENV"
-
           echo "SDK Manager: $SDKMANAGER"
 
-      - name: Install Android 16 SDK
-        timeout-minutes: 20
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
+
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+
+      - name: Install Android 16 packages
         shell: bash
         run: |
           set -e
 
-          yes | "$SDKMANAGER" \
-            --sdk_root="$ANDROID_HOME" --licenses || true
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 
-          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
+          yes | "$SDKMANAGER" --licenses || true
+
+          "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-36" \
             "emulator" \
             "system-images;android-36;google_apis;x86_64"
 
-      - name: Create Android 16 Emulator
+          # Verify ADB installation
+          if [ ! -f "$ANDROID_HOME/platform-tools/adb" ]; then
+            echo "ERROR: adb was not installed"
+            exit 1
+          fi
+
+          "$ANDROID_HOME/platform-tools/adb" version
+
+      - name: Verify emulator acceleration
+        shell: bash
         run: |
-          set -e
+          export PATH="$ANDROID_HOME/emulator:$PATH"
 
-          echo "no" | "$AVDMANAGER" create avd \
-            -n "$AVD_NAME" \
-            -k "system-images;android-36;google_apis;x86_64" \
-            -d pixel_2 \
-            --force
+          echo "CPU architecture:"
+          uname -m
 
-      - name: Start Remote ADB Server
+          echo "Checking KVM:"
+          if [ -e /dev/kvm ]; then
+            ls -l /dev/kvm
+          else
+            echo "KVM device unavailable; emulator will use software acceleration."
+          fi
+
+          emulator -accel-check || true
+
+      - name: Create Android 16 AVD
         shell: bash
         run: |
           set -e
 
-          mkdir -p diagnostics
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
 
-          # Allow ADB connections through the runner's network interfaces.
-          adb -a -P 5037 nodaemon server \
-            > adb-server.log 2>&1 &
+          echo "no" | avdmanager create avd \
+            --force \
+            --name "$AVD_NAME" \
+            --package "system-images;android-36;google_apis;x86_64" \
+            --device "pixel_2"
 
-          echo $! > adb-server.pid
-
-          for i in $(seq 1 30); do
-            if adb devices >/dev/null 2>&1; then
-              echo "ADB server is ready"
-              exit 0
-            fi
-            sleep 2
-          done
-
-          cat adb-server.log
-          exit 1
+          emulator -list-avds
 
       - name: Boot Android 16 Emulator
         timeout-minutes: 25
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          echo "Checking KVM..."
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          EMULATOR="$ANDROID_HOME/emulator/emulator"
 
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+
+          # Select acceleration based on KVM availability
           if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-            ACCEL=on
-            echo "KVM available"
+            echo "KVM detected. Using hardware acceleration."
+            ACCEL="on"
           else
-            ACCEL=off
-            echo "KVM unavailable - software emulation may be slow"
+            echo "KVM not detected. Using software acceleration."
+            ACCEL="off"
           fi
 
-          echo "Starting emulator..."
-
-          emulator \
+          # Start emulator
+          "$EMULATOR" \
             -avd "$AVD_NAME" \
             -port 5554 \
             -no-window \
-            -no-audio \
-            -no-boot-anim \
-            -no-snapshot \
-            -no-snapshot-save \
-            -wipe-data \
             -gpu swiftshader_indirect \
-            -memory 4096 \
-            -cores 2 \
+            -accel "$ACCEL" \
+            -no-snapshot \
+            -wipe-data \
+            -no-boot-anim \
+            -no-audio \
             -camera-back none \
             -camera-front none \
-            -no-metrics \
-            -accel "$ACCEL" \
+            -memory 3072 \
+            -cores 2 \
             > emulator.log 2>&1 &
 
-          EMULATOR_PID=$!
-          echo "$EMULATOR_PID" > emulator.pid
+          echo "Waiting for Android emulator..."
 
-          echo "Waiting for emulator device..."
-
-          DEVICE_READY=0
-
-          for i in $(seq 1 90); do
-            if adb -s emulator-5554 get-state \
-              >/dev/null 2>&1; then
-              DEVICE_READY=1
-              break
-            fi
-
-            if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-              echo "Emulator process stopped"
-              tail -200 emulator.log
-              exit 1
-            fi
-
-            echo "Waiting for device: $i/90"
-            sleep 5
-          done
-
-          if [ "$DEVICE_READY" != "1" ]; then
-            echo "Emulator device did not appear"
-            tail -200 emulator.log
-            exit 1
-          fi
-
-          echo "Device detected. Waiting for Android boot..."
+          "$ADB" start-server
+          "$ADB" -s emulator-5554 wait-for-device
 
           BOOTED=0
 
+          # Wait up to 15 minutes for Android boot completion
           for i in $(seq 1 180); do
-            STATUS=$(adb -s emulator-5554 shell \
-              getprop sys.boot_completed 2>/dev/null \
-              | tr -d '\r' || true)
+            STATUS=$("$ADB" -s emulator-5554 shell \
+              getprop sys.boot_completed 2>/dev/null | tr -d '\r')
 
             if [ "$STATUS" = "1" ]; then
               BOOTED=1
               break
-            fi
-
-            if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-              echo "Emulator crashed during boot"
-              tail -200 emulator.log
-              exit 1
             fi
 
             echo "Android boot progress: $i/180"
@@ -186,40 +169,39 @@ jobs:
           done
 
           if [ "$BOOTED" != "1" ]; then
-            echo "Android boot timed out"
+            echo "ERROR: Android failed to boot."
 
-            echo "Emulator log:"
-            tail -200 emulator.log
+            echo "----- Emulator log -----"
+            tail -200 emulator.log || true
 
-            echo "ADB devices:"
-            adb devices -l
+            echo "----- ADB devices -----"
+            "$ADB" devices -l || true
 
-            echo "Android properties:"
-            adb -s emulator-5554 shell getprop || true
-
-            echo "Android logcat:"
-            adb -s emulator-5554 logcat -d -t 500 || true
+            echo "----- Android properties -----"
+            "$ADB" -s emulator-5554 shell getprop || true
 
             exit 1
           fi
 
+          "$ADB" -s emulator-5554 shell wm size 1080x1920
+          "$ADB" -s emulator-5554 shell wm density 420
+
           echo "Android 16 successfully booted!"
 
-          adb -s emulator-5554 shell wm size 1080x1920
-          adb -s emulator-5554 shell wm density 420
-
-          adb -s emulator-5554 shell input keyevent 82
-
-          echo "Android version:"
-          adb -s emulator-5554 shell getprop ro.build.version.release
-
-      - name: Install Optional APK
-        if: success()
+      - name: Install APK
+        shell: bash
+        env:
+          APK_PATH: ${{ inputs.apk_path }}
         run: |
-          if [ -f "app/app-release.apk" ]; then
-            adb -s emulator-5554 install -r app/app-release.apk
+          set -e
+
+          ADB="$ANDROID_HOME/platform-tools/adb"
+
+          if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
+            "$ADB" -s emulator-5554 install -r "$APK_PATH"
+            echo "APK installed successfully."
           else
-            echo "No APK found. Skipping installation."
+            echo "APK not found. Skipping installation."
           fi
 
       - name: Connect Tailscale
@@ -229,83 +211,71 @@ jobs:
           hostname: github-android-emulator
           tags: tag:github-runner
 
-      - name: Display Remote ADB Connection
+      - name: Enable Remote ADB
         shell: bash
         run: |
-          echo "=================================="
-          echo "ANDROID 16 REMOTE ADB"
-          echo "=================================="
+          set -e
 
-          TAILSCALE_IP=$(tailscale ip -4)
+          ADB="$ANDROID_HOME/platform-tools/adb"
 
-          echo "Tailscale IP: $TAILSCALE_IP"
-          echo "ADB Port: 5037"
-          echo ""
-          echo "Run on your Windows PC:"
-          echo "adb -H $TAILSCALE_IP -P 5037 devices"
-          echo ""
-          echo "Open remote shell:"
-          echo "adb -H $TAILSCALE_IP -P 5037 shell"
-          echo "=================================="
+          # Restart ADB listening on all network interfaces
+          "$ADB" kill-server || true
+          "$ADB" -a start-server
 
-          tailscale status
-          adb devices -l
+          sleep 5
 
-      - name: Keep Emulator Running
+          echo "ADB listening status:"
+          ss -lntp | grep 5037
+
+          echo "Connected devices:"
+          "$ADB" devices -l
+
+          echo "Tailscale IP:"
+          tailscale ip -4
+
+      - name: Display Connection Details
         shell: bash
         run: |
-          echo "Android 16 emulator is running."
+          TS_IP=$(tailscale ip -4)
+
+          echo "## Android 16 Remote Emulator" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tailscale IP: $TS_IP" >> "$GITHUB_STEP_SUMMARY"
+          echo "ADB Server: $TS_IP:5037" >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo ""
+            echo "### Windows PowerShell commands"
+            echo '```powershell'
+            echo "adb -H $TS_IP -P 5037 devices"
+            echo "adb -H $TS_IP -P 5037 shell"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Remote ADB address: $TS_IP:5037"
+
+      - name: Keep Emulator Alive
+        shell: bash
+        run: |
+          ADB="$ANDROID_HOME/platform-tools/adb"
+
+          echo "Remote Android emulator is running."
+          echo "Cancel this workflow to stop it."
 
           while true; do
-            echo "=================================="
-            date -u
-
-            if ! adb -s emulator-5554 get-state \
-              >/dev/null 2>&1; then
-              echo "ERROR: Emulator is no longer available"
-              tail -100 emulator.log
-              exit 1
-            fi
-
-            echo "Android:"
-            adb -s emulator-5554 shell \
-              getprop sys.boot_completed
-
-            echo "Tailscale:"
+            echo "------------------------------"
+            date
+            "$ADB" devices -l
             tailscale status
-
-            echo "ADB devices:"
-            adb devices -l
-
             sleep 60
           done
 
-      - name: Collect Diagnostics
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p diagnostics
-
-          cp emulator.log diagnostics/ 2>/dev/null || true
-          cp adb-server.log diagnostics/ 2>/dev/null || true
-
-          adb devices -l \
-            > diagnostics/adb-devices.txt 2>&1 || true
-
-          adb -s emulator-5554 logcat -d \
-            > diagnostics/logcat.txt 2>&1 || true
-
-          adb -s emulator-5554 shell getprop \
-            > diagnostics/android-properties.txt 2>&1 || true
-
-          free -h > diagnostics/memory.txt 2>&1 || true
-          df -h > diagnostics/disk.txt 2>&1 || true
-
-      - name: Upload Boot Diagnostics
+      - name: Upload Emulator Diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: android-16-diagnostics
-          path: diagnostics/
+          name: android16-emulator-diagnostics
+          path: |
+            emulator.log
           if-no-files-found: ignore
           retention-days: 3
